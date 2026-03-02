@@ -48,7 +48,8 @@ SITE_PASSWORD = os.environ.get('SITE_PASSWORD', 'Diamonds')
 
 def fetch_market_data():
     """Fetch 1 year of daily SPX and VIX data from Yahoo Finance.
-    Also returns the last 60 days as arrays for accurate EMA seeding.
+    Also returns the last 60 days as arrays for accurate EMA seeding
+    and a chart_data dict for the candlestick chart.
     """
     print("  Fetching SPX data...")
     spx = yf.download('^GSPC', period='1y', interval='1d',
@@ -61,9 +62,10 @@ def fetch_market_data():
         raise RuntimeError("Failed to fetch market data. Check internet connection.")
 
     sc = spx['Close'].squeeze()
-    vc = vix['Close'].squeeze()
+    so = spx['Open'].squeeze()
     sh = spx['High'].squeeze()
     sl = spx['Low'].squeeze()
+    vc = vix['Close'].squeeze()
 
     spx_price = float(sc.iloc[-1])
     spx_prev  = float(sc.iloc[-2])
@@ -87,6 +89,7 @@ def fetch_market_data():
     sc_arr = sc.values.flatten().astype(float)
 
     def _ema(arr, period):
+        """Scalar EMA — returns a single current value."""
         if len(arr) < period:
             return None
         val = arr[:period].mean()          # seed with SMA
@@ -95,14 +98,57 @@ def fetch_market_data():
             val = p * k + val * (1 - k)
         return round(float(val), 2)
 
+    def _ema_series(arr, period):
+        """EMA series — returns one value per bar (None until enough data)."""
+        result = [None] * len(arr)
+        if len(arr) < period:
+            return result
+        val = arr[:period].mean()
+        k   = 2.0 / (period + 1)
+        result[period - 1] = round(float(val), 2)
+        for i in range(period, len(arr)):
+            val = arr[i] * k + val * (1 - k)
+            result[i] = round(float(val), 2)
+        return result
+
+    def _sma_series(arr, period):
+        """SMA series — returns one value per bar (None until enough data)."""
+        result = [None] * len(arr)
+        for i in range(period - 1, len(arr)):
+            result[i] = round(float(arr[i - period + 1:i + 1].mean()), 2)
+        return result
+
     yf_ema9  = _ema(sc_arr, 9)
     yf_ema21 = _ema(sc_arr, 21)
     yf_sma50 = round(float(sc_arr[-50:].mean()), 2) if len(sc_arr) >= 50 else None
 
+    # ── Build chart_data (last 60 trading days) ─────────────────────────
+    chart_days    = 60
+    so_arr        = so.values.flatten().astype(float)
+    sh_arr        = sh.values.flatten().astype(float)
+    sl_arr        = sl.values.flatten().astype(float)
+    dates_full    = [str(d.date()) for d in sc.index]
+
+    ema9_series   = _ema_series(sc_arr, 9)
+    ema21_series  = _ema_series(sc_arr, 21)
+    sma50_series  = _sma_series(sc_arr, 50)
+
+    chart_data = {
+        'dates': dates_full[-chart_days:],
+        'open':  [round(float(v), 2) for v in so_arr[-chart_days:]],
+        'high':  [round(float(v), 2) for v in sh_arr[-chart_days:]],
+        'low':   [round(float(v), 2) for v in sl_arr[-chart_days:]],
+        'close': [round(float(v), 2) for v in sc_arr[-chart_days:]],
+        'ema9':  ema9_series[-chart_days:],
+        'ema21': ema21_series[-chart_days:],
+        'sma50': sma50_series[-chart_days:],
+    }
+
     return (spx_price, spx_prev, spx_high, spx_low, spx_52w,
             vix_level, vix_prev,
             sc_list, sh_list, sl_list, vc_list, dates_list,
-            yf_ema9, yf_ema21, yf_sma50)
+            yf_ema9, yf_ema21, yf_sma50,
+            chart_data)
 
 # ════════════════════════════════════════════════════════════════════════════
 # HISTORY
@@ -468,7 +514,8 @@ def badge(status, note):
 
 def generate_html(spx_price, spx_prev, spx_high, spx_low, spx_52w,
                   vix_level, vix_prev, records, emas, key_levels,
-                  env_name, env_key, env_detail, triggers, perms):
+                  env_name, env_key, env_detail, triggers, perms,
+                  chart_data=None):
 
     et     = pytz.timezone('US/Eastern')
     now_et = datetime.now(et)
@@ -563,6 +610,70 @@ def generate_html(spx_price, spx_prev, spx_high, spx_low, spx_52w,
         )
     else:
         kl_html = ""
+
+    # ── Chart section ────────────────────────────────────────────────────
+    if chart_data:
+        chart_json = json.dumps(chart_data)
+        chart_html = f"""
+  <section class="section">
+    <h2 class="section-title">SPX &mdash; 60-Day Chart with EMA 9 / EMA 21 / SMA 50</h2>
+    <div style="background:#0d1526;border:1px solid rgba(201,168,76,.18);border-radius:12px;overflow:hidden;">
+      <div id="spx-chart" style="width:100%;height:340px;"></div>
+      <div style="display:flex;gap:20px;justify-content:center;padding:10px 0 12px;font-size:.72rem;color:#94a3b8;">
+        <span><span style="display:inline-block;width:18px;height:2px;background:#f59e0b;vertical-align:middle;margin-right:5px;border-radius:2px;"></span>EMA 9</span>
+        <span><span style="display:inline-block;width:18px;height:2px;background:#10b981;vertical-align:middle;margin-right:5px;border-radius:2px;"></span>EMA 21</span>
+        <span><span style="display:inline-block;width:18px;height:2px;background:#a78bfa;vertical-align:middle;margin-right:5px;border-radius:2px;"></span>SMA 50</span>
+      </div>
+    </div>
+  </section>
+<script src="https://unpkg.com/lightweight-charts@4.1.4/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+(function(){{
+  var d = {chart_json};
+  var el = document.getElementById('spx-chart');
+  var chart = LightweightCharts.createChart(el, {{
+    layout:{{ background:{{ color:'#0d1526' }}, textColor:'#94a3b8', fontSize:11 }},
+    grid:{{ vertLines:{{ color:'rgba(255,255,255,0.04)' }}, horzLines:{{ color:'rgba(255,255,255,0.04)' }} }},
+    crosshair:{{ mode:1 }},
+    rightPriceScale:{{ borderColor:'rgba(201,168,76,0.15)', scaleMargins:{{ top:0.08, bottom:0.08 }} }},
+    timeScale:{{ borderColor:'rgba(201,168,76,0.15)', timeVisible:true, secondsVisible:false }},
+    width: el.clientWidth,
+    height: 340,
+  }});
+
+  var cs = chart.addCandlestickSeries({{
+    upColor:'#10b981', downColor:'#ef4444',
+    borderUpColor:'#10b981', borderDownColor:'#ef4444',
+    wickUpColor:'#10b981', wickDownColor:'#ef4444',
+  }});
+  cs.setData(d.dates.map(function(t,i){{
+    return {{time:t, open:d.open[i], high:d.high[i], low:d.low[i], close:d.close[i]}};
+  }}));
+
+  function lineData(values) {{
+    return d.dates.reduce(function(acc,t,i){{
+      if(values[i]!==null) acc.push({{time:t, value:values[i]}});
+      return acc;
+    }},[]);
+  }}
+
+  var e9 = chart.addLineSeries({{ color:'#f59e0b', lineWidth:1.5, priceLineVisible:false, lastValueVisible:true }});
+  e9.setData(lineData(d.ema9));
+
+  var e21 = chart.addLineSeries({{ color:'#10b981', lineWidth:1.5, priceLineVisible:false, lastValueVisible:true }});
+  e21.setData(lineData(d.ema21));
+
+  var s50 = chart.addLineSeries({{ color:'#a78bfa', lineWidth:1.5, priceLineVisible:false, lastValueVisible:true }});
+  s50.setData(lineData(d.sma50));
+
+  chart.timeScale().fitContent();
+
+  var ro = new ResizeObserver(function(){{ chart.applyOptions({{width:el.clientWidth}}); }});
+  ro.observe(el);
+}})();
+</script>"""
+    else:
+        chart_html = ""
 
     # ── Misc ─────────────────────────────────────────────────────────────
     hist_note  = (f"Signal quality improving — {len(records)} day(s) of history on file."
@@ -719,6 +830,8 @@ function checkPw(){{
 
   {kl_html}
 
+  {chart_html}
+
   <section class="section">
     <h2 class="section-title">Today's Environment</h2>
     <div class="env-card">
@@ -834,7 +947,8 @@ def main():
     result = fetch_market_data()
     spx_price, spx_prev, spx_high, spx_low, spx_52w, vix_level, vix_prev = result[:7]
     sc_list, sh_list, sl_list, vc_list, dates_list                        = result[7:12]
-    yf_ema9, yf_ema21, yf_sma50                                           = result[12:]
+    yf_ema9, yf_ema21, yf_sma50                                           = result[12:15]
+    chart_data                                                             = result[15]
     print(f"  SPX: {spx_price:,.2f}  |  VIX: {vix_level:.2f}")
 
     # Build yfinance 70d records (used for history/ATR/GI calcs)
@@ -871,7 +985,8 @@ def main():
     html = generate_html(
         spx_price, spx_prev, spx_high, spx_low, spx_52w,
         vix_level, vix_prev, records, emas, key_levels,
-        env_name, env_key, env_detail, triggers, perms
+        env_name, env_key, env_detail, triggers, perms,
+        chart_data
     )
 
     with open(OUTPUT_PATH, 'w', encoding='utf-8') as f:
@@ -882,4 +997,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
