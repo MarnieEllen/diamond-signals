@@ -74,7 +74,7 @@ def fetch_market_data():
     vix_level = float(vc.iloc[-1])
     vix_prev  = float(vc.iloc[-2])
 
-    # Pull 70 days of OHLC for accurate EMA seeding (more than 50 needed)
+    # Pull 70 days of OHLC for history/EMA seeding
     window = 70
     sc_list    = [float(v) for v in sc.tail(window)]
     sh_list    = [float(v) for v in sh.tail(window)]
@@ -82,9 +82,27 @@ def fetch_market_data():
     vc_list    = [float(v) for v in vc.tail(window)]
     dates_list = [str(d.date()) for d in sc.tail(window).index]
 
+    # ── Compute EMA 9, EMA 21, SMA 50 from FULL 1-year dataset ─────────
+    # Using the full year gives accurate values from day 1.
+    sc_arr = sc.values.flatten().astype(float)
+
+    def _ema(arr, period):
+        if len(arr) < period:
+            return None
+        val = arr[:period].mean()          # seed with SMA
+        k   = 2.0 / (period + 1)
+        for p in arr[period:]:
+            val = p * k + val * (1 - k)
+        return round(float(val), 2)
+
+    yf_ema9  = _ema(sc_arr, 9)
+    yf_ema21 = _ema(sc_arr, 21)
+    yf_sma50 = round(float(sc_arr[-50:].mean()), 2) if len(sc_arr) >= 50 else None
+
     return (spx_price, spx_prev, spx_high, spx_low, spx_52w,
             vix_level, vix_prev,
-            sc_list, sh_list, sl_list, vc_list, dates_list)
+            sc_list, sh_list, sl_list, vc_list, dates_list,
+            yf_ema9, yf_ema21, yf_sma50)
 
 # ════════════════════════════════════════════════════════════════════════════
 # HISTORY
@@ -167,7 +185,7 @@ def compute_key_levels(records, spx_now, spx_52w_high, emas):
     if emas.get('ema21'):
         levels['EMA 21'] = (emas['ema21'], 'directional anchor')
     if emas.get('ema50'):
-        levels['EMA 50'] = (emas['ema50'], 'trend baseline')
+        levels['SMA 50'] = (emas['ema50'], 'trend baseline')
 
     # 10-day price range
     if n >= 10:
@@ -253,11 +271,11 @@ def classify_environment(records, spx_now, vix_now, emas):
     # ── EMA description fragment ─────────────────────────────────────────
     ema_desc = ""
     if e9 and e21 and e50:
-        ema_desc = f" EMA stack: 9={e9:,.0f} / 21={e21:,.0f} / 50={e50:,.0f}."
+        ema_desc = f" EMA 9={e9:,.0f} / EMA 21={e21:,.0f} / SMA 50={e50:,.0f}."
     elif e9 and e21:
-        ema_desc = f" EMA 9={e9:,.0f} / 21={e21:,.0f} (50d EMA still building)."
+        ema_desc = f" EMA 9={e9:,.0f} / EMA 21={e21:,.0f} (SMA 50 building)."
     else:
-        ema_desc = " (EMA stack building — more history needed for full signal.)"
+        ema_desc = " (Technicals building — more history needed for full signal.)"
 
     # ── Classification ───────────────────────────────────────────────────
     if is_stress:
@@ -518,7 +536,7 @@ def generate_html(spx_price, spx_prev, spx_high, spx_low, spx_52w,
     # ── Key Levels section ───────────────────────────────────────────────
     if key_levels:
         # Sort: EMAs first, then 10d range, then round numbers, then 52w
-        ema_k   = [k for k in key_levels if k.startswith('EMA')]
+        ema_k   = [k for k in key_levels if k.startswith('EMA') or k.startswith('SMA')]
         rng_k   = [k for k in key_levels if k.startswith('10d')]
         round_k = [k for k in key_levels if k[0].isdigit()]
         other_k = [k for k in key_levels if k not in ema_k + rng_k + round_k]
@@ -815,10 +833,11 @@ def main():
     print("◆ DIAMOND Auto Signal Generator (v2 — enhanced intelligence)")
     result = fetch_market_data()
     spx_price, spx_prev, spx_high, spx_low, spx_52w, vix_level, vix_prev = result[:7]
-    sc_list, sh_list, sl_list, vc_list, dates_list = result[7:]
+    sc_list, sh_list, sl_list, vc_list, dates_list                        = result[7:12]
+    yf_ema9, yf_ema21, yf_sma50                                           = result[12:]
     print(f"  SPX: {spx_price:,.2f}  |  VIX: {vix_level:.2f}")
 
-    # Build yfinance 70d records (used for EMA accuracy — better than local history alone)
+    # Build yfinance 70d records (used for history/ATR/GI calcs)
     yf_records = build_records_from_yf(sc_list, sh_list, sl_list, vc_list, dates_list)
 
     # Update local history
@@ -826,14 +845,15 @@ def main():
     hist = update_history(hist, spx_price, spx_high, spx_low, vix_level, today_str)
     save_history(hist)
 
-    # Merge: yfinance as base (better seed), local history takes precedence
+    # Merge: yfinance as base, local history takes precedence
     yf_by_date    = {r['date']: r for r in yf_records}
     local_by_date = {r['date']: r for r in hist['records']}
     merged = {**yf_by_date, **local_by_date}
     records = sorted(merged.values(), key=lambda r: r['date'])
 
-    # Compute derived values
-    emas       = compute_emas(records)
+    # Use yfinance-computed EMAs/SMA (accurate from full 1-year dataset from day 1)
+    emas = {'ema9': yf_ema9, 'ema21': yf_ema21, 'ema50': yf_sma50}
+
     key_levels = compute_key_levels(records, spx_price, spx_52w, emas)
 
     env_name, env_key, env_detail = classify_environment(records, spx_price, vix_level, emas)
@@ -841,8 +861,8 @@ def main():
 
     e9, e21, e50 = emas.get('ema9'), emas.get('ema21'), emas.get('ema50')
     if e9 and e21:
-        e50_str = f"{e50:,.0f}" if e50 else "building"
-        print(f"  EMA 9/21/50: {e9:,.0f} / {e21:,.0f} / {e50_str}")
+        e50_str = f"{e50:,.0f}" if e50 else "—"
+        print(f"  EMA 9: {e9:,.0f}  |  EMA 21: {e21:,.0f}  |  SMA 50: {e50_str}")
 
     triggers = gi_triggers(records, spx_price, spx_52w, vix_level)
     perms    = permissions(env_key)
@@ -862,3 +882,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
